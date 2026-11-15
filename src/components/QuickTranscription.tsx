@@ -34,10 +34,12 @@ export default function QuickTranscription(){
   const [loginSent,setLoginSent]=useState(false);
   const media=useRef<MediaRecorder|null>(null);
   const tracks=useRef<MediaStream|null>(null);
-  const timer=useRef<number|undefined>();
+  const timer=useRef<number|undefined>(undefined);
   const currentStart=useRef(0);
   const spent=useRef(0);
   const mimeRef=useRef("audio/webm");
+  const recordScope=useRef("guest");
+  const lastSavedAt=useRef(0);
   const writes=useRef<Promise<unknown>>(Promise.resolve());
   const blobUrl=useRef("");
   const mounted=useRef(true);
@@ -51,11 +53,6 @@ export default function QuickTranscription(){
   }
   useEffect(()=>{
     mounted.current=true;
-    recoverDraft().then(d=>{
-      if(!mounted.current||!d)return;
-      setBlob(d.blob);setElapsed(d.durationMs);setMime(d.type);setPhase("ready");
-      setNotice(d.partial?"Gravação interrompida recuperada. Ouça antes de enviar.":"Sua última gravação foi recuperada.");
-    }).catch(()=>setNotice("Recuperação local indisponível neste navegador."));
     let subscription:{unsubscribe:()=>void}|undefined;
     if(auth){
       auth.auth.getSession().then(({data})=>{if(mounted.current)setSession(data.session);});
@@ -63,8 +60,21 @@ export default function QuickTranscription(){
     }
     return ()=>{mounted.current=false;subscription?.unsubscribe();stopClock();release();polling.current?.abort();if(blobUrl.current)URL.revokeObjectURL(blobUrl.current)};
   },[]);
+  const ownerId=session?.user.id||"guest";
+  useEffect(()=>{
+    let active=true;
+    if(["recording","paused","sending","processing"].includes(phase))return;
+    if(blobUrl.current)URL.revokeObjectURL(blobUrl.current);
+    blobUrl.current="";setAudio(null);setPlayerSrc("");setTranscript("");setPhase("idle");setElapsed(0);
+    recoverDraft(ownerId).then(d=>{
+      if(!mounted.current||!active||!d)return;
+      setBlob(d.blob);setElapsed(d.durationMs);setMime(d.type);setPhase("ready");
+      setNotice(d.partial?"Gravação interrompida recuperada. Ouça antes de enviar.":"Sua última gravação foi recuperada.");
+    }).catch(()=>setNotice("Recuperação local indisponível neste navegador."));
+    return ()=>{active=false};
+  },[ownerId]);
   function saveMeta(ms:number,status:"recording"|"stopped"){
-    writes.current=writes.current.then(()=>saveDraftMeta({startedAt:Date.now()-ms,elapsedMs:ms,mimeType:mimeRef.current,status})).catch(()=>setNotice("O navegador não conseguiu salvar o rascunho."));
+    writes.current=writes.current.then(()=>saveDraftMeta(recordScope.current,{startedAt:Date.now()-ms,elapsedMs:ms,mimeType:mimeRef.current,status})).catch(()=>setNotice("O navegador não conseguiu salvar o rascunho."));
   }
   function finish(){
     const m=media.current;
@@ -79,6 +89,7 @@ export default function QuickTranscription(){
     timer.current=window.setInterval(()=>{
       const ms=Math.min(MAX_MS,spent.current+Date.now()-currentStart.current);
       setElapsed(ms);
+      if(ms-lastSavedAt.current>=5000){lastSavedAt.current=ms;saveMeta(ms,"recording");}
       if(ms>=MAX_MS)finish();
     },200);
   }
@@ -91,18 +102,19 @@ export default function QuickTranscription(){
     try{
       const stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true}});
       tracks.current=stream;
-      await clearDraft();
+      recordScope.current=session?.user.id||"guest";
+      await clearDraft(recordScope.current);
       if(blobUrl.current)URL.revokeObjectURL(blobUrl.current);
       blobUrl.current="";setAudio(null);setPlayerSrc("");setElapsed(0);
       const preferred=formats.find(x=>MediaRecorder.isTypeSupported(x));
       const rec=preferred?new MediaRecorder(stream,{mimeType:preferred,audioBitsPerSecond:64000}):new MediaRecorder(stream,{audioBitsPerSecond:64000});
-      mimeRef.current=rec.mimeType.split(";")[0]||"audio/webm";setMime(mimeRef.current);
+      mimeRef.current=rec.mimeType.split(";")[0]||"audio/webm";setMime(mimeRef.current);lastSavedAt.current=0;
       media.current=rec;spent.current=0;canceled.current=false;writes.current=Promise.resolve();
       let chunks:Blob[]=[];
       rec.ondataavailable=event=>{
         if(event.data.size===0)return;
         chunks.push(event.data);
-        writes.current=writes.current.then(()=>appendAudioChunk(event.data)).catch(()=>setNotice("Seu áudio não está sendo salvo localmente. Evite fechar esta página."));
+        writes.current=writes.current.then(()=>appendAudioChunk(recordScope.current,event.data)).catch(()=>setNotice("Seu áudio não está sendo salvo localmente. Evite fechar esta página."));
       };
       rec.onstop=()=>{
         stopClock();release();
@@ -131,7 +143,7 @@ export default function QuickTranscription(){
   async function discard(){
     canceled.current=true;polling.current?.abort();
     if(media.current&&media.current.state!=="inactive")media.current.stop();
-    stopClock();release();await writes.current.catch(()=>{});await clearDraft().catch(()=>{});
+    stopClock();release();await writes.current.catch(()=>{});await clearDraft(recordScope.current).catch(()=>{});
     if(blobUrl.current)URL.revokeObjectURL(blobUrl.current);
     blobUrl.current="";setAudio(null);setPlayerSrc("");setElapsed(0);setTranscript("");setNotice("");setError("");setPhase("idle");spent.current=0;
   }
@@ -154,7 +166,7 @@ export default function QuickTranscription(){
       const data=await response.json() as JobResponse;
       if(!response.ok)throw Error(data.error||"O gateway não respondeu.");
       if(data.status==="ready"){
-        setCached(Boolean(data.cached));setTranscript(data.transcription||"");setPhase("done");return;
+        setCached(Boolean(data.cached));setTranscript(data.transcription||"");setPhase("done");await clearDraft(recordScope.current).catch(()=>{});return;
       }
       if(!data.jobId)throw Error("Resposta inválida do gateway.");
       setPhase("processing");const controller=new AbortController();polling.current=controller;
@@ -166,7 +178,7 @@ export default function QuickTranscription(){
         });
         const result=await check.json() as JobResponse;
         if(!check.ok)throw Error(result.error||"Falha na consulta.");
-        if(result.status==="ready"){setTranscript(result.transcription||"");setPhase("done");await clearDraft().catch(()=>{});return;}
+        if(result.status==="ready"){setTranscript(result.transcription||"");setPhase("done");await clearDraft(recordScope.current).catch(()=>{});return;}
         if(result.status==="failed")throw Error(result.error||"Transcrição falhou.");
       }
       throw Error("O processamento demorou. Sua sessão não será enviada novamente.");
