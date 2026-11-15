@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "test:gateway": "node --import tsx --test tests/*.test.ts"
+    "test:gateway": "node --import tsx --test tests/*.test.ts",
+    "test:visual": "node tests/transcription-mobile-visual.mjs"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
@@ -37,6 +38,7 @@
     "tailwindcss": "^4.3.3",
     "tsx": "^4.21.0",
     "typescript": "^7.0.2",
-    "@types/express": "^4.17.21"
+    "@types/express": "^4.17.21",
+    "playwright": "^1.56.0"
   }
 }
