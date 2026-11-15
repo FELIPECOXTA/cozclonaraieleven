@@ -1,7 +1,7 @@
 import type { Express, Request, Response } from "express";
 import Redis from "ioredis";
 import { createRemoteJWKSet, jwtVerify } from "jose";
-import { createHash, createHmac, randomUUID } from "node:crypto";
+import { createHash, createHmac, createCipheriv, createDecipheriv, randomBytes, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -48,6 +48,26 @@ export function scopedCacheKey(secret: string, userId: string, audio: Buffer): s
 }
 
 type Job = { id: string; userId: string; status: "processing" | "ready" | "failed"; transcript?: string; error?: string; duration: number };
+
+/** Criptografa o texto antes de persistir no Redis. A chave só existe no servidor. */
+export function sealTranscript(value:string,secret:string):string {
+  const key=createHash("sha256").update(secret+"|transcription-encryption").digest();
+  const nonce=randomBytes(12);
+  const cipher=createCipheriv("aes-256-gcm",key,nonce);
+  const ciphertext=Buffer.concat([cipher.update(value,"utf8"),cipher.final()]);
+  const tag=cipher.getAuthTag();
+  return [nonce.toString("base64url"),tag.toString("base64url"),ciphertext.toString("base64url")].join(".");
+}
+export function unsealTranscript(payload:string,secret:string):string {
+  const parts=payload.split(".");
+  if(parts.length!==3)throw Error("Invalid encrypted transcription");
+  const [nonce,tag,data]=parts.map(part=>Buffer.from(part,"base64url"));
+  const key=createHash("sha256").update(secret+"|transcription-encryption").digest();
+  const decipher=createDecipheriv("aes-256-gcm",key,nonce);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(data),decipher.final()]).toString("utf8");
+}
+
 const redisUrl = process.env.REDIS_URL;
 const supabaseUrl = (process.env.SUPABASE_URL || "").replace(/\/+$/, "");
 const cacheSecret = process.env.TRANSCRIPTION_CACHE_SECRET;
@@ -95,8 +115,8 @@ async function processJob(
   try {
     const transcript = await transcribeViaElevenLabs(audio, mime);
     // Results stored privately, only retrievable after verified JWT for the matching user.
-    await redis.set("ov:result:" + cacheKey, transcript, "EX", RESULT_TTL_SECONDS);
-    await redis.set(key, JSON.stringify({ ...job, status: "ready", transcript }), "EX", JOB_TTL_SECONDS);
+    await redis.set("ov:result:" + cacheKey, sealTranscript(transcript,cacheSecret!), "EX", RESULT_TTL_SECONDS);
+    await redis.set(key, JSON.stringify({ ...job, status: "ready", transcript: sealTranscript(transcript,cacheSecret!) }), "EX", JOB_TTL_SECONDS);
   } catch {
     await redis.set(key, JSON.stringify({ ...job, status: "failed", error: "Não foi possível transcrever. Tente novamente." }), "EX", JOB_TTL_SECONDS);
     // Restore free attempt on provider failure only if this job claimed it.
@@ -123,7 +143,7 @@ export function mountTranscriptionGateway(app: Express) {
     const cacheKey = scopedCacheKey(cacheSecret!, userId, audio);
     try {
       const cached = await redis.get("ov:result:" + cacheKey);
-      if (cached !== null) return res.json({ status: "ready", cached: true, transcription: cached, duration });
+      if (cached !== null) return res.json({ status: "ready", cached: true, transcription: unsealTranscript(cached,cacheSecret!), duration });
       const existing = await redis.get("ov:pending:" + cacheKey);
       if (existing) {
         const status = await redis.get("ov:job:" + existing);
@@ -154,7 +174,7 @@ export function mountTranscriptionGateway(app: Express) {
       if (!json) return res.status(404).json({ error: "Tarefa expirada ou não encontrada." });
       const job = JSON.parse(json) as Job;
       if (job.userId !== userId) return res.status(404).json({ error: "Tarefa não encontrada." });
-      return res.json({ status: job.status, transcription: job.status === "ready" ? job.transcript : undefined, error: job.error });
+      return res.json({ status: job.status, transcription: job.status === "ready" && job.transcript ? unsealTranscript(job.transcript,cacheSecret!) : undefined, error: job.error });
     } catch { return res.status(503).json({ error: "Não foi possível consultar a tarefa." }); }
   });
 }
