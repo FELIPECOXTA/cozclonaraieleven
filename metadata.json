@@ -1,0 +1,6 @@
+{
+  "name": "VozClonar AI - Estúdio de Clonagem & Síntese de Voz",
+  "description": "Clone a voz a partir de 1 a 3 áudios de referência e sintetize qualquer texto na voz da pessoa com IA Gemini.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
