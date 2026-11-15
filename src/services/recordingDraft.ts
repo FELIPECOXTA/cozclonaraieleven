@@ -12,10 +12,10 @@ const requestResult = <T,>(req: IDBRequest<T>) => new Promise<T>((resolve,reject
   req.onsuccess=()=>resolve(req.result);
   req.onerror=()=>reject(req.error||new Error("IndexedDB indisponível"));
 });
-async function openDb(): Promise<IDBDatabase> {
+async function openDb(ownerId:string): Promise<IDBDatabase> {
   if (!("indexedDB" in globalThis)) throw Error("IndexedDB unavailable");
   return new Promise((resolve,reject)=>{
-    const req=indexedDB.open(DB_NAME,1);
+    const req=indexedDB.open(DB_NAME+"-"+ownerId.replace(/[^a-zA-Z0-9_-]/g,""),1);
     req.onupgradeneeded=()=>{
       const db=req.result;
       if(!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE);
@@ -25,8 +25,8 @@ async function openDb(): Promise<IDBDatabase> {
     req.onerror=()=>reject(req.error||new Error("Database unavailable"));
   });
 }
-async function withStore<T>(storeName:string,mode:IDBTransactionMode,fn:(store:IDBObjectStore)=>IDBRequest<T>):Promise<T>{
-  const db=await openDb();
+async function withStore<T>(ownerId:string,storeName:string,mode:IDBTransactionMode,fn:(store:IDBObjectStore)=>IDBRequest<T>):Promise<T>{
+  const db=await openDb(ownerId);
   try {
     const trx=db.transaction(storeName,mode);
     const answer=await requestResult(fn(trx.objectStore(storeName)));
@@ -34,8 +34,8 @@ async function withStore<T>(storeName:string,mode:IDBTransactionMode,fn:(store:I
     return answer;
   }finally{db.close()}
 }
-export async function clearDraft():Promise<void>{
-  const db=await openDb();
+export async function clearDraft(ownerId:string):Promise<void>{
+  const db=await openDb(ownerId);
   try{
     const trx=db.transaction([STORE,CHUNKS],"readwrite");
     trx.objectStore(STORE).clear();
@@ -43,14 +43,14 @@ export async function clearDraft():Promise<void>{
     await new Promise<void>((resolve,reject)=>{trx.oncomplete=()=>resolve();trx.onerror=()=>reject(trx.error)});
   }finally{db.close()}
 }
-export function saveDraftMeta(meta:DraftMeta):Promise<IDBValidKey>{
-  return withStore(STORE,"readwrite",s=>s.put(meta,KEY));
+export function saveDraftMeta(ownerId:string,meta:DraftMeta):Promise<IDBValidKey>{
+  return withStore(ownerId,STORE,"readwrite",s=>s.put(meta,KEY));
 }
-export function appendAudioChunk(chunk:Blob):Promise<IDBValidKey>{
-  return withStore(CHUNKS,"readwrite",s=>s.add(chunk));
+export function appendAudioChunk(ownerId:string,chunk:Blob):Promise<IDBValidKey>{
+  return withStore(ownerId,CHUNKS,"readwrite",s=>s.add(chunk));
 }
-export async function recoverDraft():Promise<RecoveredDraft|null>{
-  const db=await openDb();
+export async function recoverDraft(ownerId:string):Promise<RecoveredDraft|null>{
+  const db=await openDb(ownerId);
   try {
     const trx=db.transaction([STORE,CHUNKS],"readonly");
     const meta=await requestResult(trx.objectStore(STORE).get(KEY)) as DraftMeta|undefined;
