@@ -5,6 +5,7 @@ import { createServer as createViteServer } from "vite";
 import path from "path";
 import { fileURLToPath } from "url";
 import fs from "fs";
+import { mountTranscriptionGateway } from "./src/server/transcriptionGateway";
 
 dotenv.config();
 
@@ -17,6 +18,16 @@ const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 // Middleware for large payload (audio base64)
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
+
+// Rota assíncrona protegida: sem usuário autenticado e Redis, falha fechada.
+mountTranscriptionGateway(app);
+// Recursos antigos sem autenticação ficam desativados por padrão.
+// O produto comercial expõe apenas transcrição até a revisão de segurança.
+const LEGACY_API = /^\/api\/(?:voices(?:\/|$)|elevenlabs(?:\/|$)|generate-speech(?:\/|$)|analyze-voice(?:\/|$)|clone-and-synthesize(?:\/|$)|chat(?:\/|$)|generate-image(?:\/|$))/;
+app.use((req, res, next) => {
+  if (process.env.ENABLE_LEGACY_VOICE_TOOLS === "true" || !LEGACY_API.test(req.path)) return next();
+  res.status(404).json({ error: "Recurso não disponível nesta versão." });
+});
 
 // Server-side Gemini client
 const getAiClient = () => {
