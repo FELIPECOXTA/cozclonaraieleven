@@ -77,7 +77,7 @@ export default function QuickTranscription(){
       setBlob(d.blob);setElapsed(d.durationMs);setMime(d.type);
       if(!pending)setPhase("ready");
       setNotice(d.partial?"Recuperamos a gravação interrompida. Ouça antes de enviar.":"Sua gravação ficou salva neste aparelho.");
-    }).catch(()=>setNotice("A gravação local não pôde ser recuperada neste navegador."));
+    }).catch(()=>setNotice("Não conseguimos recuperar sua última gravação neste aparelho."));
     recoverTranscript(ownerId).then(saved=>{
       if(!mounted.current||!active||!saved||pending)return;
       setCached(true);setTranscript(saved);
@@ -110,7 +110,7 @@ export default function QuickTranscription(){
     if(phase==="recording"||phase==="paused")return;
     setError("");setNotice("");setTranscript("");setCached(false);
     if(!navigator.mediaDevices?.getUserMedia||typeof MediaRecorder==="undefined"){
-      setError("Microfone indisponível. Abra em HTTPS e atualize Safari ou Chrome.");return;
+      setError("O microfone não está disponível neste navegador. Atualize o aplicativo ou abra no navegador do celular.");return;
     }
     try{
       const stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true}});
@@ -149,7 +149,7 @@ export default function QuickTranscription(){
       rec.onerror=()=>setError("Erro do microfone. Tente gravar novamente.");
       rec.start(1000);currentStart.current=Date.now();setPhase("recording");saveMeta(0,"recording");tick();
     }catch{
-      release();setError("Não consegui acessar o microfone. Verifique a permissão.");setPhase("idle");
+      release();setError("Não consegui acessar o microfone. Confira a permissão nas configurações do navegador.");setPhase("idle");
     }
   }
   function togglePause(){
@@ -245,7 +245,7 @@ export default function QuickTranscription(){
     try {
       payload=JSON.stringify({audioBase64:await asBase64(audio),mimeType:mime});
     } catch {
-      setPhase("ready");setNotice("Não foi possível preparar o áudio. Ele continua salvo para tentar novamente.");return;
+      setPhase("ready");setNotice("Não conseguimos preparar o áudio agora. Sua gravação está salva e você pode tentar novamente.");return;
     }
     for(let attempt=0;attempt<2;attempt++){
       const controller=new AbortController();
@@ -318,7 +318,7 @@ export default function QuickTranscription(){
     </section>}
     {!session&&<section className="rounded-2xl p-4 border border-indigo-800 bg-slate-900 space-y-2">
       <h3 className="font-semibold">Entre na sua conta para enviar</h3>
-      {!auth?<p className="text-sm text-amber-200">Autenticação ainda não configurada neste ambiente. A gravação local funciona, mas o envio está bloqueado para proteger sua cota e a chave da ElevenLabs.</p>:<>
+      {!auth?<p className="text-sm text-amber-200">O acesso ainda não está disponível aqui. Você pode gravar agora e enviar quando o serviço estiver liberado.</p>:<>
         <input type="email" value={email} onChange={e=>setEmail(e.target.value)} placeholder="Seu e-mail" aria-label="Seu e-mail" autoComplete="email" className="w-full rounded-xl min-h-12 bg-slate-800 px-3 border border-slate-600"/>
         <button type="button" onClick={()=>void login()} className="w-full min-h-11 rounded-xl bg-indigo-700">Receber link de acesso</button>
         {loginSent&&<p className="text-sm text-emerald-200">Confira seu e-mail para entrar.</p>}
