@@ -21,6 +21,13 @@ app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
 // Rota assíncrona protegida: sem usuário autenticado e Redis, falha fechada.
 mountTranscriptionGateway(app);
+// Recursos antigos sem autenticação ficam desativados por padrão.
+// O produto comercial expõe apenas transcrição até a revisão de segurança.
+const LEGACY_API = /^\/api\/(?:voices(?:\/|$)|elevenlabs(?:\/|$)|generate-speech(?:\/|$)|analyze-voice(?:\/|$)|clone-and-synthesize(?:\/|$)|chat(?:\/|$)|generate-image(?:\/|$))/;
+app.use((req, res, next) => {
+  if (process.env.ENABLE_LEGACY_VOICE_TOOLS === "true" || !LEGACY_API.test(req.path)) return next();
+  res.status(404).json({ error: "Recurso não disponível nesta versão." });
+});
 
 // Server-side Gemini client
 const getAiClient = () => {
