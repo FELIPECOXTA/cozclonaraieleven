@@ -20,16 +20,16 @@ import {
   Bookmark,
   Key,
 } from "lucide-react";
-import { ClonedVoice } from "./types";
-import { ElevenLabsSpeechSynthesis } from "./components/ElevenLabsSpeechSynthesis";
-import { ElevenLabsCreateVoice } from "./components/ElevenLabsCreateVoice";
-import { ElevenLabsVoiceLibrary } from "./components/ElevenLabsVoiceLibrary";
-import { ElevenLabsVoiceChanger } from "./components/ElevenLabsVoiceChanger";
-import { ElevenLabsSoundEffects } from "./components/ElevenLabsSoundEffects";
-import { VoiceClonerStudio } from "./components/VoiceClonerStudio";
-import { ChatAssistant } from "./components/ChatAssistant";
-import { ImageStudio } from "./components/ImageStudio";
-import { ApiKeyModal } from "./components/ApiKeyModal";
+import type { ClonedVoice } from "./types";
+const ElevenLabsSpeechSynthesis = React.lazy(() => import("./components/ElevenLabsSpeechSynthesis").then(m => ({ default: m.ElevenLabsSpeechSynthesis })));
+const ElevenLabsCreateVoice = React.lazy(() => import("./components/ElevenLabsCreateVoice").then(m => ({ default: m.ElevenLabsCreateVoice })));
+const ElevenLabsVoiceLibrary = React.lazy(() => import("./components/ElevenLabsVoiceLibrary").then(m => ({ default: m.ElevenLabsVoiceLibrary })));
+const ElevenLabsVoiceChanger = React.lazy(() => import("./components/ElevenLabsVoiceChanger").then(m => ({ default: m.ElevenLabsVoiceChanger })));
+const ElevenLabsSoundEffects = React.lazy(() => import("./components/ElevenLabsSoundEffects").then(m => ({ default: m.ElevenLabsSoundEffects })));
+const VoiceClonerStudio = React.lazy(() => import("./components/VoiceClonerStudio").then(m => ({ default: m.VoiceClonerStudio })));
+const ChatAssistant = React.lazy(() => import("./components/ChatAssistant").then(m => ({ default: m.ChatAssistant })));
+const ImageStudio = React.lazy(() => import("./components/ImageStudio").then(m => ({ default: m.ImageStudio })));
+const ApiKeyModal = React.lazy(() => import("./components/ApiKeyModal").then(m => ({ default: m.ApiKeyModal })));
 import QuickTranscription from "./components/QuickTranscription";
 
 type TabKey = "transcription" | "synthesis" | "create-voice" | "sts" | "sfx" | "library" | "slots3" | "chat" | "images" | "guide";
@@ -40,27 +40,12 @@ export default function App() {
   const [showLegacyTools,setShowLegacyTools] = useState(false);
 
   // ElevenLabs API Key state
-  const [elevenLabsApiKey, setElevenLabsApiKey] = useState<string>(() => {
-    try {
-      return localStorage.getItem("elevenlabs_api_key") || "";
-    } catch {
-      return "";
-    }
-  });
+  // Nunca persistir chaves de provedores no localStorage.
+  const [elevenLabsApiKey, setElevenLabsApiKey] = useState("");
+  const legacyEnabled = import.meta.env.VITE_ENABLE_LEGACY_TOOLS === "true";
   const [isApiKeyModalOpen, setIsApiKeyModalOpen] = useState(false);
 
-  const handleSaveApiKey = (newKey: string) => {
-    setElevenLabsApiKey(newKey);
-    try {
-      if (newKey) {
-        localStorage.setItem("elevenlabs_api_key", newKey);
-      } else {
-        localStorage.removeItem("elevenlabs_api_key");
-      }
-    } catch (err) {
-      console.warn("Falha ao salvar chave no localStorage:", err);
-    }
-  };
+  const handleSaveApiKey = (newKey: string) => setElevenLabsApiKey(newKey);
 
   // Voices loaded from server
   const [voices, setVoices] = useState<ClonedVoice[]>([]);
@@ -148,7 +133,7 @@ export default function App() {
           </div>
 
           {/* ElevenLabs API Key Connection Pill */}
-          {showLegacyTools && <div className="flex items-center gap-2">
+          {legacyEnabled && showLegacyTools && <div className="flex items-center gap-2">
             <button
               type="button"
               onClick={() => setIsApiKeyModalOpen(true)}
@@ -174,10 +159,10 @@ export default function App() {
               className={"flex items-center gap-2 px-4 py-2 rounded-xl min-h-11 text-sm font-bold whitespace-nowrap "+(activeTab==="transcription"?"bg-emerald-600 text-white":"bg-slate-800 text-white")}>
               <Mic size={18}/> Transcrever áudio
             </button>
-            <button type="button" onClick={() => setShowLegacyTools(v => !v)}
+            {legacyEnabled && <button type="button" onClick={() => setShowLegacyTools(v => !v)}
               className="min-h-11 px-3 py-2 rounded-xl text-xs text-slate-300 whitespace-nowrap"
-              aria-expanded={showLegacyTools}>Outras ferramentas</button>
-            {showLegacyTools && <>
+              aria-expanded={showLegacyTools}>Outras ferramentas</button>}
+            {legacyEnabled && showLegacyTools && <>
             <button
               onClick={() => setActiveTab("synthesis")}
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold transition-all whitespace-nowrap ${
@@ -283,6 +268,7 @@ export default function App() {
 
       {/* Main Container */}
       <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 lg:p-8">
+      <React.Suspense fallback={<p role="status">Carregando ferramenta...</p>}>
         {activeTab === "transcription" && <QuickTranscription/>}
         {/* Tab 1: ElevenLabs Speech Synthesis (Texto para Fala) */}
         {activeTab === "synthesis" && (
@@ -364,15 +350,16 @@ export default function App() {
             <ImageStudio />
           </div>
         )}
+      </React.Suspense>
       </main>
 
       {/* Modal for connecting ElevenLabs API Key */}
-      <ApiKeyModal
+      {legacyEnabled && <ApiKeyModal
         isOpen={isApiKeyModalOpen}
         onClose={() => setIsApiKeyModalOpen(false)}
         currentKey={elevenLabsApiKey}
         onSaveKey={handleSaveApiKey}
-      />
+      />}
 
       {/* Footer */}
       <footer className="border-t border-slate-800/80 bg-slate-950/60 px-4 py-4 text-center text-xs text-slate-500">
@@ -384,7 +371,7 @@ export default function App() {
             </span>
           </div>
           <div className="flex items-center gap-4 text-slate-400">
-            <span>Modelos: eleven_multilingual_v2 • gemini-3.8-flash-lite-tts • gemini-3-pro-image-preview</span>
+            <span>Gravação local · Transcrição sob demanda · Cota protegida por conta</span>
           </div>
         </div>
       </footer>
