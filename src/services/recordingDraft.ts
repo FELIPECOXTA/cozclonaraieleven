@@ -4,6 +4,7 @@
 const DB_NAME = "oraculo-recording-draft";
 const STORE = "draft";
 const CHUNKS = "chunks";
+const RESULTS = "results";
 const KEY = "current";
 export type DraftMeta = { startedAt: number; elapsedMs: number; mimeType: string; status: "recording" | "stopped" };
 export type RecoveredDraft = { blob: Blob; durationMs: number; type: string; partial: boolean };
@@ -15,11 +16,12 @@ const requestResult = <T,>(req: IDBRequest<T>) => new Promise<T>((resolve,reject
 async function openDb(ownerId:string): Promise<IDBDatabase> {
   if (!("indexedDB" in globalThis)) throw Error("IndexedDB unavailable");
   return new Promise((resolve,reject)=>{
-    const req=indexedDB.open(DB_NAME+"-"+ownerId.replace(/[^a-zA-Z0-9_-]/g,""),1);
+    const req=indexedDB.open(DB_NAME+"-"+ownerId.replace(/[^a-zA-Z0-9_-]/g,""),2);
     req.onupgradeneeded=()=>{
       const db=req.result;
       if(!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE);
       if(!db.objectStoreNames.contains(CHUNKS)) db.createObjectStore(CHUNKS,{autoIncrement:true});
+      if(!db.objectStoreNames.contains(RESULTS)) db.createObjectStore(RESULTS);
     };
     req.onsuccess=()=>resolve(req.result);
     req.onerror=()=>reject(req.error||new Error("Database unavailable"));
@@ -59,4 +61,15 @@ export async function recoverDraft(ownerId:string):Promise<RecoveredDraft|null>{
     const blob=new Blob(chunks,{type:meta.mimeType});
     return blob.size ? {blob,durationMs:meta.elapsedMs,type:meta.mimeType,partial:meta.status==="recording"} : null;
   }finally{db.close()}
+}
+
+/** Somente a transcrição fica disponível no cache local (24h), sempre separada por conta. */
+export async function saveTranscript(ownerId:string,text:string):Promise<void>{
+  await withStore(ownerId,RESULTS,"readwrite",store=>
+    store.put({text,expires:Date.now()+86400000},"latest"));
+}
+export async function recoverTranscript(ownerId:string):Promise<string|null>{
+  const value=await withStore(ownerId,RESULTS,"readonly",store=>store.get("latest"));
+  if(!value||typeof value.text!=="string"||value.expires<Date.now())return null;
+  return value.text;
 }
