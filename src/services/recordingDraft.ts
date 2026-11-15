@@ -73,3 +73,19 @@ export async function recoverTranscript(ownerId:string):Promise<string|null>{
   if(!value||typeof value.text!=="string"||value.expires<Date.now())return null;
   return value.text;
 }
+
+/** Após login, migra o rascunho anônimo deste dispositivo para a conta, caso não exista
+ * outro rascunho. Sem upload e sem misturar duas contas autenticadas.
+ */
+export async function adoptGuestDraft(ownerId:string):Promise<void> {
+  if(!ownerId||ownerId==="guest")return;
+  if(await recoverDraft(ownerId))return;
+  const guest=await recoverDraft("guest");
+  if(!guest)return;
+  const now=Date.now();
+  await saveDraftMeta(ownerId,{
+    startedAt:now-guest.durationMs,elapsedMs:guest.durationMs,mimeType:guest.type,status:"stopped"
+  });
+  await appendAudioChunk(ownerId,guest.blob);
+  await clearDraft("guest");
+}
