@@ -1,5 +1,6 @@
 import type { Express, Request, Response } from "express";
 import Redis from "ioredis";
+import { Queue, Worker } from "bullmq";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { createHash, createHmac, createCipheriv, createDecipheriv, randomBytes, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
@@ -7,13 +8,16 @@ import { promisify } from "node:util";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { createTranscriptionProviders, transcribeWithFallback } from "./transcriptionProviders";
 
 const exec = promisify(execFile);
 export const MAX_AUDIO_SECONDS = 180;
+export const GATEWAY_BUDGET_MS = 14_000;
 const MAX_BYTES = 15 * 1024 * 1024;
-const MAX_GATEWAY_MS = 14_000;
 const JOB_TTL_SECONDS = 30 * 60;
 const RESULT_TTL_SECONDS = 24 * 3600;
+const FREE_WINDOW_SECONDS = 90 * 86400; // MVP trial. Move to persistent DB before charging.
+const QUEUE_NAME = "voice-transcription-v1";
 const AUDIO_TYPES = new Set([
   "audio/webm", "audio/ogg", "audio/mp4", "audio/mpeg",
   "audio/mp3", "audio/wav", "audio/x-wav", "audio/aac"
@@ -28,8 +32,8 @@ export function decodeAudio(base64: unknown): Buffer | null {
   return data.length > 0 && data.length <= MAX_BYTES ? data : null;
 }
 export async function verifyDuration(data: Buffer): Promise<number> {
-  const dir = await mkdtemp(path.join(os.tmpdir(), "oraculo-record-"));
-  const filepath = path.join(dir, "recording");
+  const dir = await mkdtemp(path.join(os.tmpdir(), "voice-record-"));
+  const filepath = path.join(dir, "audio");
   try {
     await writeFile(filepath, data, { mode: 0o600 });
     const { stdout } = await exec(
@@ -38,7 +42,7 @@ export async function verifyDuration(data: Buffer): Promise<number> {
       { timeout: 3_000, maxBuffer: 128_000 }
     );
     const seconds = Number(stdout.trim());
-    if (!Number.isFinite(seconds) || seconds <= 0) throw Error("Invalid audio duration");
+    if (!Number.isFinite(seconds) || seconds <= 0) throw Error("Invalid duration");
     return seconds;
   } finally { await rm(dir, { recursive: true, force: true }); }
 }
@@ -46,10 +50,14 @@ export function scopedCacheKey(secret: string, userId: string, audio: Buffer): s
   const hash = createHash("sha256").update(audio).digest("hex");
   return createHmac("sha256", secret).update(userId + ":" + hash).digest("hex");
 }
+type JobStatus = "processing" | "ready" | "failed";
+type PublicJob = { id: string; userId: string; status: JobStatus; duration: number; transcript?: string; error?: string };
+type QueueData = {
+  userId: string; jobId: string; mime: string; audioEncrypted: string;
+  cacheKey: string; freeKey: string; pendingKey: string; duration: number;
+};
 
-type Job = { id: string; userId: string; status: "processing" | "ready" | "failed"; transcript?: string; error?: string; duration: number };
-
-/** Criptografa o texto antes de persistir no Redis. A chave só existe no servidor. */
+/** AES-256-GCM for both job audio and cached text; never store plaintext in Redis. */
 export function sealTranscript(value:string,secret:string):string {
   const key=createHash("sha256").update(secret+"|transcription-encryption").digest();
   const nonce=randomBytes(12);
@@ -60,7 +68,7 @@ export function sealTranscript(value:string,secret:string):string {
 }
 export function unsealTranscript(payload:string,secret:string):string {
   const parts=payload.split(".");
-  if(parts.length!==3)throw Error("Invalid encrypted transcription");
+  if(parts.length!==3)throw Error("Invalid encrypted data");
   const [nonce,tag,data]=parts.map(part=>Buffer.from(part,"base64url"));
   const key=createHash("sha256").update(secret+"|transcription-encryption").digest();
   const decipher=createDecipheriv("aes-256-gcm",key,nonce);
@@ -71,110 +79,138 @@ export function unsealTranscript(payload:string,secret:string):string {
 const redisUrl = process.env.REDIS_URL;
 const supabaseUrl = (process.env.SUPABASE_URL || "").replace(/\/+$/, "");
 const cacheSecret = process.env.TRANSCRIPTION_CACHE_SECRET;
-const elevenlabsKey = process.env.ELEVENLABS_API_KEY;
-const configured = Boolean(redisUrl && supabaseUrl && cacheSecret && elevenlabsKey);
-const redis = configured ? new Redis(redisUrl!, { lazyConnect: true, maxRetriesPerRequest: 1, connectTimeout: 3000 }) : null;
+const providers = createTranscriptionProviders();
+const configured = Boolean(redisUrl && supabaseUrl && cacheSecret && providers.length);
+const redis = configured ? new Redis(redisUrl!, { maxRetriesPerRequest: null, connectTimeout: 3000 }) : null;
+const queue = redis ? new Queue<QueueData>(QUEUE_NAME, { connection: redis }) : null;
 const jwks = supabaseUrl ? createRemoteJWKSet(new URL(supabaseUrl + "/auth/v1/.well-known/jwks.json")) : null;
-if (redis) redis.on("error", () => { /* failure is reported by route responses; do not log private payloads */ });
+if (redis) redis.on("error", () => { /* do not log secrets */ });
 
 async function getUserId(req: Request): Promise<string | null> {
   if (!jwks) return null;
   const header = req.headers.authorization || "";
   if (!/^Bearer [^\s]+$/.test(header)) return null;
   try {
-    const jwt = header.slice(7);
-    const { payload } = await jwtVerify(jwt, jwks, {
+    const { payload } = await jwtVerify(header.slice(7), jwks, {
       issuer: supabaseUrl + "/auth/v1",
       audience: "authenticated",
       algorithms: ["RS256", "ES256"]
     });
-    return typeof payload.sub === "string" && payload.sub.length > 0 ? payload.sub : null;
+    return typeof payload.sub === "string" && payload.sub ? payload.sub : null;
   } catch { return null; }
 }
-
-async function transcribeViaElevenLabs(audio: Buffer, mime: string): Promise<string> {
-  const form = new FormData();
-  form.append("model_id", "scribe_v2");
-  form.append("file", new Blob([new Uint8Array(audio)], { type: mime }), "gravacao");
-  const response = await fetch("https://api.elevenlabs.io/v1/speech-to-text", {
-    method: "POST",
-    headers: { "xi-api-key": elevenlabsKey! },
-    body: form,
-    signal: AbortSignal.timeout(110_000)
+function gatewayGuard(res: Response) {
+  res.setHeader("Cache-Control","no-store");
+  // The reverse proxy must also limit end-to-end request time, including upload.
+  res.setTimeout(GATEWAY_BUDGET_MS, () => {
+    if (!res.headersSent) res.status(504).json({ error:"Este envio está demorando. Sua gravação continua salva no aparelho.", retryable:true });
   });
-  if (!response.ok) throw Error("Speech-to-text provider unavailable");
-  const payload = await response.json() as { text?: string };
-  if (typeof payload.text !== "string" || !payload.text.trim()) throw Error("Empty transcription");
-  return payload.text.trim();
 }
-async function processJob(
-  job: Job, audio: Buffer, mime: string, cacheKey: string, freeKey: string
-) {
-  if (!redis) return;
-  const key = "ov:job:" + job.id;
+const JOB_PREFIX="ov:job:";
+const RESULT_PREFIX="ov:result:";
+async function finishJob(data:QueueData) {
+  if (!redis || !cacheSecret) throw Error("Storage unavailable");
+  const jobKey = JOB_PREFIX + data.jobId;
+  const current=await redis.get(jobKey);
+  if (current && (JSON.parse(current) as PublicJob).status === "ready") return;
+  const raw = unsealTranscript(data.audioEncrypted, cacheSecret);
+  const audio = Buffer.from(raw, "base64");
+  const job:PublicJob={id:data.jobId,userId:data.userId,status:"processing",duration:data.duration};
   try {
-    const transcript = await transcribeViaElevenLabs(audio, mime);
-    // Results stored privately, only retrievable after verified JWT for the matching user.
-    await redis.set("ov:result:" + cacheKey, sealTranscript(transcript,cacheSecret!), "EX", RESULT_TTL_SECONDS);
-    await redis.set(key, JSON.stringify({ ...job, status: "ready", transcript: sealTranscript(transcript,cacheSecret!) }), "EX", JOB_TTL_SECONDS);
+    const result=await transcribeWithFallback(providers,{audio,mime:data.mime},
+      (provider,outcome,elapsed)=>{if(outcome!=="starting")console.info("[stt] stage",provider,outcome,elapsed+"ms");}
+    );
+    const encrypted=sealTranscript(result.text,cacheSecret);
+    await redis.set(RESULT_PREFIX + data.cacheKey, encrypted, "EX", RESULT_TTL_SECONDS);
+    await redis.set(jobKey,JSON.stringify({...job,status:"ready",transcript:encrypted}),"EX",JOB_TTL_SECONDS);
   } catch {
-    await redis.set(key, JSON.stringify({ ...job, status: "failed", error: "Não foi possível transcrever. Tente novamente." }), "EX", JOB_TTL_SECONDS);
-    // Restore free attempt on provider failure only if this job claimed it.
-    const existing = await redis.get(freeKey);
-    if (existing === job.id) await redis.del(freeKey);
+    await redis.set(jobKey,JSON.stringify({...job,status:"failed",error:"Não conseguimos concluir agora. Sua gravação está preservada."}),"EX",JOB_TTL_SECONDS);
+    // Never charge the free session if all providers fail.
+    const claimed = await redis.get(data.freeKey);
+    if (claimed === data.jobId) await redis.del(data.freeKey);
+  } finally {
+    if (await redis.get(data.pendingKey) === data.jobId) await redis.del(data.pendingKey);
   }
 }
+let worker:Worker<QueueData>|null=null;
+function startWorker() {
+  if (worker || !redis) return;
+  worker=new Worker<QueueData>(QUEUE_NAME, async task => {
+    await finishJob(task.data);
+  }, { connection: redis.duplicate(), concurrency: 2, lockDuration: 90_000 });
+  worker.on("error", () => { /* monitored in infrastructure */ });
+}
 export function mountTranscriptionGateway(app: Express) {
-  // The API gateway must acknowledge with cached result or job ID in <= 14s;
-  // never hold an HTTP response open for three minutes of AI inference.
-  app.post("/api/transcription/jobs", async (req: Request, res: Response) => {
-    res.setTimeout(MAX_GATEWAY_MS, () => { if (!res.headersSent) res.status(504).json({ error: "Gateway timeout", retryable: true }); });
-    res.setHeader("Cache-Control", "no-store");
-    if (!configured || !redis) return res.status(503).json({ error: "Transcrição temporariamente indisponível. Configure autenticação e armazenamento seguro." });
-    const userId = await getUserId(req);
-    if (!userId) return res.status(401).json({ error: "Entre na sua conta para transcrever." });
-    const mime = typeof req.body?.mimeType === "string" ? req.body.mimeType.toLowerCase().split(";")[0] : "";
-    const audio = decodeAudio(req.body?.audioBase64);
-    if (!audio || !isPermittedMime(mime)) return res.status(400).json({ error: "Áudio inválido ou formato incompatível." });
-    let duration: number;
-    try { duration = await verifyDuration(audio); }
-    catch { return res.status(400).json({ error: "Formato de áudio inválido. Verifique se o arquivo não está corrompido." }); }
-    if (duration > MAX_AUDIO_SECONDS + 0.75) return res.status(413).json({ error: "A duração máxima é de três minutos." });
-    const cacheKey = scopedCacheKey(cacheSecret!, userId, audio);
+  if (queue) startWorker();
+  app.post("/api/transcription/jobs",async(req:Request,res:Response)=>{
+    gatewayGuard(res);
+    if (!configured || !queue || !redis || !cacheSecret) return res.status(503).json({error:"Transcrição indisponível por enquanto. Tente novamente mais tarde."});
+    const userId=await getUserId(req);
+    if (!userId)return res.status(401).json({error:"Entre na sua conta para enviar o áudio."});
+    const mime=typeof req.body?.mimeType==="string"?req.body.mimeType.toLowerCase().split(";")[0].trim():"";
+    const audio=decodeAudio(req.body?.audioBase64);
+    if(!audio||!isPermittedMime(mime))return res.status(400).json({error:"Não foi possível ler sua gravação. Grave novamente."});
+    let duration:number;
+    try {duration=await verifyDuration(audio);}
+    catch {return res.status(400).json({error:"Não conseguimos verificar a gravação. Confira e tente novamente."});}
+    if(duration>MAX_AUDIO_SECONDS+0.75)return res.status(413).json({error:"O áudio deve ter até 3 minutos."});
+    const cacheKey=scopedCacheKey(cacheSecret,userId,audio);
+    const pendingKey="ov:pending:"+cacheKey;
+    const freeKey="ov:free:"+userId;
+    let locked=false;
+    let freeClaimed=false;
+    const jobId=randomUUID();
     try {
-      const cached = await redis.get("ov:result:" + cacheKey);
-      if (cached !== null) return res.json({ status: "ready", cached: true, transcription: unsealTranscript(cached,cacheSecret!), duration });
-      const existing = await redis.get("ov:pending:" + cacheKey);
-      if (existing) {
-        const status = await redis.get("ov:job:" + existing);
-        if (status && JSON.parse(status).status === "processing") return res.status(202).json({ status: "processing", jobId: existing, reused: true });
+      const cached=await redis.get(RESULT_PREFIX+cacheKey);
+      if(cached!==null)return res.json({status:"ready",cached:true,transcription:unsealTranscript(cached,cacheSecret),duration});
+      const pending=await redis.get(pendingKey);
+      if(pending){
+        const pendingJob=await redis.get(JOB_PREFIX+pending);
+        if(pendingJob && (JSON.parse(pendingJob) as PublicJob).status==="processing")
+          return res.status(202).json({status:"processing",jobId:pending,reused:true});
       }
-      const freeKey = "ov:free:" + userId;
-      const jobId = randomUUID();
-      const claimed = await redis.set(freeKey, jobId, "EX", 90 * 86400, "NX");
-      if (claimed !== "OK") return res.status(429).json({ error: "Sua sessão gratuita já foi utilizada." });
-      const job: Job = { id: jobId, userId, status: "processing", duration };
-      await redis.set("ov:job:" + jobId, JSON.stringify(job), "EX", JOB_TTL_SECONDS);
-      await redis.set("ov:pending:" + cacheKey, jobId, "EX", JOB_TTL_SECONDS);
-      // No provider call in request/response path. In single-instance MVP the job
-      // runs in this process; production needs a durable external job queue.
-      setImmediate(() => { void processJob(job, audio, mime, cacheKey, freeKey).catch(() => {}); });
-      return res.status(202).json({ status: "processing", jobId, estimatedMaximumSeconds: 180 });
-    } catch { return res.status(503).json({ error: "Armazenamento temporariamente indisponível." }); }
+      locked=(await redis.set(pendingKey,jobId,"EX",JOB_TTL_SECONDS,"NX"))==="OK";
+      if(!locked){
+        const existing=await redis.get(pendingKey);
+        if(existing)return res.status(202).json({status:"processing",jobId:existing,reused:true});
+        return res.status(503).json({error:"Ainda estamos preparando sua transcrição. Tente mais uma vez."});
+      }
+      freeClaimed=(await redis.set(freeKey,jobId,"EX",FREE_WINDOW_SECONDS,"NX"))==="OK";
+      if(!freeClaimed){
+        await redis.del(pendingKey);
+        locked=false;
+        return res.status(429).json({error:"Sua sessão gratuita já foi utilizada."});
+      }
+      const newJob:PublicJob={id:jobId,userId,status:"processing",duration};
+      await redis.set(JOB_PREFIX+jobId,JSON.stringify(newJob),"EX",JOB_TTL_SECONDS);
+      await queue.add("speech-to-text",{
+        jobId,userId,mime,duration,cacheKey,pendingKey,freeKey,
+        audioEncrypted:sealTranscript(audio.toString("base64"),cacheSecret),
+      },{jobId,attempts:1,removeOnComplete:{age:3600,count:1000},removeOnFail:{age:3600,count:1000}});
+      return res.status(202).json({status:"processing",jobId});
+    } catch {
+      // Roll back only this newly reserved job; an existing finished job isn't touched.
+      if(locked && await redis.get(pendingKey)===jobId)await redis.del(pendingKey).catch(()=>{});
+      if(freeClaimed && await redis.get(freeKey)===jobId)await redis.del(freeKey).catch(()=>{});
+      return res.status(503).json({error:"Não foi possível iniciar agora. Seu áudio continua no aparelho."});
+    }
   });
-  app.get("/api/transcription/jobs/:jobId", async (req: Request, res: Response) => {
-    res.setTimeout(MAX_GATEWAY_MS);
-    res.setHeader("Cache-Control", "no-store");
-    if (!configured || !redis) return res.status(503).json({ error: "Serviço indisponível." });
-    const userId = await getUserId(req);
-    if (!userId) return res.status(401).json({ error: "Entre na sua conta." });
-    if (!/^[0-9a-f-]{36}$/i.test(req.params.jobId)) return res.status(400).json({ error: "Identificador inválido." });
-    try {
-      const json = await redis.get("ov:job:" + req.params.jobId);
-      if (!json) return res.status(404).json({ error: "Tarefa expirada ou não encontrada." });
-      const job = JSON.parse(json) as Job;
-      if (job.userId !== userId) return res.status(404).json({ error: "Tarefa não encontrada." });
-      return res.json({ status: job.status, transcription: job.status === "ready" && job.transcript ? unsealTranscript(job.transcript,cacheSecret!) : undefined, error: job.error });
-    } catch { return res.status(503).json({ error: "Não foi possível consultar a tarefa." }); }
+  app.get("/api/transcription/jobs/:jobId",async(req:Request,res:Response)=>{
+    gatewayGuard(res);
+    if(!configured||!redis||!cacheSecret)return res.status(503).json({error:"Serviço temporariamente indisponível."});
+    const userId=await getUserId(req);
+    if(!userId)return res.status(401).json({error:"Entre na sua conta para continuar."});
+    if(!/^[0-9a-f-]{36}$/i.test(req.params.jobId))return res.status(404).json({error:"Não encontramos essa transcrição."});
+    try{
+      const raw=await redis.get(JOB_PREFIX+req.params.jobId);
+      if(!raw)return res.status(404).json({error:"Não encontramos essa transcrição. Seu áudio continua no aparelho."});
+      const job=JSON.parse(raw) as PublicJob;
+      if(job.userId!==userId)return res.status(404).json({error:"Não encontramos essa transcrição."});
+      return res.json({
+        status:job.status,
+        transcription:job.status==="ready"&&job.transcript?unsealTranscript(job.transcript,cacheSecret):undefined,
+        error:job.status==="failed"?job.error:undefined,
+      });
+    }catch{return res.status(503).json({error:"Estamos tentando consultar sua transcrição. Aguarde um instante."});}
   });
 }
