@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { createClient, type Session } from "@supabase/supabase-js";
 import { Mic, Send, Pause, Play, Trash2, Copy, Loader2 } from "lucide-react";
-import { clearDraft, saveDraftMeta, appendAudioChunk, recoverDraft, saveTranscript, recoverTranscript } from "../services/recordingDraft";
+import { clearDraft, saveDraftMeta, appendAudioChunk, recoverDraft, saveTranscript, recoverTranscript, adoptGuestDraft } from "../services/recordingDraft";
 import { rememberPendingJob, recoverPendingJob, forgetPendingJob } from "../services/pendingJob";
 
 const MAX_MS=180000;
@@ -72,7 +72,7 @@ export default function QuickTranscription(){
     blobUrl.current="";setAudio(null);setPlayerSrc("");setTranscript("");
     setPhase(pending?"processing":"idle");setElapsed(0);
     // Recover the local recording before asking for another provider request.
-    recoverDraft(ownerId).then(d=>{
+    Promise.resolve(loggedIn?adoptGuestDraft(loggedIn):undefined).then(()=>recoverDraft(ownerId)).then(d=>{
       if(!mounted.current||!active||!d)return;
       setBlob(d.blob);setElapsed(d.durationMs);setMime(d.type);
       if(!pending)setPhase("ready");
@@ -236,11 +236,17 @@ export default function QuickTranscription(){
     if(!audio||audio.size>15*1024*1024){setNotice("Não foi possível ler a gravação. Confira o áudio.");return;}
     if(elapsed>MAX_MS){setNotice("A gravação pode ter até três minutos.");return;}
     const accountId=session.user.id;
+    if(recordScope.current==="guest")await adoptGuestDraft(accountId).catch(()=>{});
     recordScope.current=accountId;
     const alreadyPending=recoverPendingJob(accountId);
     if(alreadyPending){void watchJob(alreadyPending,session.access_token,accountId);return;}
     setError("");setNotice("");setPhase("sending");
-    const payload=JSON.stringify({audioBase64:await asBase64(audio),mimeType:mime});
+    let payload:string;
+    try {
+      payload=JSON.stringify({audioBase64:await asBase64(audio),mimeType:mime});
+    } catch {
+      setPhase("ready");setNotice("Não foi possível preparar o áudio. Ele continua salvo para tentar novamente.");return;
+    }
     for(let attempt=0;attempt<2;attempt++){
       const controller=new AbortController();
       const deadline=setTimeout(()=>controller.abort(),13000);
