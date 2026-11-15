@@ -25,7 +25,8 @@
     "motion": "^12.23.24",
     "@supabase/supabase-js": "^2.57.0",
     "ioredis": "^5.4.2",
-    "jose": "^5.9.6"
+    "jose": "^5.9.6",
+    "bullmq": "^5.58.0"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",
