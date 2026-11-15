@@ -81,7 +81,10 @@ const supabaseUrl = (process.env.SUPABASE_URL || "").replace(/\/+$/, "");
 const cacheSecret = process.env.TRANSCRIPTION_CACHE_SECRET;
 const providers = createTranscriptionProviders();
 const configured = Boolean(redisUrl && supabaseUrl && cacheSecret && providers.length);
-const redis = configured ? new Redis(redisUrl!, { maxRetriesPerRequest: null, connectTimeout: 3000 }) : null;
+// Falhar rapidamente nas operações HTTP para não prender o usuário.
+const redis = configured ? new Redis(redisUrl!, {
+  maxRetriesPerRequest: 1, enableOfflineQueue: false, connectTimeout: 1500,
+}) : null;
 const queue = redis ? new Queue<QueueData>(QUEUE_NAME, { connection: redis }) : null;
 const jwks = supabaseUrl ? createRemoteJWKSet(new URL(supabaseUrl + "/auth/v1/.well-known/jwks.json")) : null;
 if (redis) redis.on("error", () => { /* do not log secrets */ });
@@ -137,7 +140,7 @@ function startWorker() {
   if (worker || !redis) return;
   worker=new Worker<QueueData>(QUEUE_NAME, async task => {
     await finishJob(task.data);
-  }, { connection: redis.duplicate(), concurrency: 2, lockDuration: 90_000 });
+  }, { connection: new Redis(redisUrl!, { maxRetriesPerRequest: null, connectTimeout: 3000 }), concurrency: 2, lockDuration: 90_000 });
   worker.on("error", () => { /* monitored in infrastructure */ });
 }
 export function mountTranscriptionGateway(app: Express) {
