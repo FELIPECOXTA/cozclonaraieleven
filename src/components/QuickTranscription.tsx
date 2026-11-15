@@ -83,7 +83,7 @@ export default function QuickTranscription(){
       setCached(true);setTranscript(saved);
       setPhase(prev=>prev==="idle"?"done":prev);
     }).catch(()=>{});
-    if(pending&&session)void watchJob(pending,session.access_token,loggedIn);
+    if(pending&&session&&loggedIn)void watchJob(pending,session.access_token,loggedIn);
     return ()=>{active=false;pollSequence.current++;polling.current?.abort();};
   },[ownerId]);
   function saveMeta(ms:number,status:"recording"|"stopped"){
