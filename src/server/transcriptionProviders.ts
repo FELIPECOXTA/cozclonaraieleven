@@ -32,18 +32,28 @@ export async function transcribeWithFallback(
   for (const provider of providers) {
     const started = Date.now();
     const controller = new AbortController();
-    const timeout = sleep(() => controller.abort(new Error("provider deadline")), provider.budgetMs);
+    let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
       report?.(provider.name, "starting", 0);
-      const text = (await provider.transcribe({ ...input, signal: controller.signal })).trim();
+      const deadline = new Promise<never>((_, reject) => {
+        timeout = sleep(() => {
+          controller.abort(new Error("provider deadline"));
+          reject(new Error("provider deadline"));
+        }, provider.budgetMs);
+      });
+      const text = (await Promise.race([
+        provider.transcribe({ ...input, signal: controller.signal }),
+        deadline,
+      ])).trim();
       if (controller.signal.aborted || !text) throw new Error("No transcription");
       report?.(provider.name, "success", Date.now() - started);
       return { text, provider: provider.name };
     } catch {
       // Do not expose model errors, texts or API keys in logs / client responses.
+      controller.abort();
       report?.(provider.name, "failed", Date.now() - started);
     } finally {
-      clearTimeout(timeout);
+      if (timeout !== undefined) clearTimeout(timeout);
     }
   }
   throw new ProvidersUnavailable();
@@ -92,9 +102,9 @@ export function createTranscriptionProviders(env: NodeJS.ProcessEnv = process.en
             headers: { "x-goog-api-key": env.GEMINI_API_KEY!, "Content-Type": "application/json" },
             body: JSON.stringify({
               contents: [{ role: "user", parts: [
-                { text: "Transcreva fielmente o áudio no idioma original. Não invente falas, nomes ou palavras. Se inaudível, marque [inaudível]. Retorne apenas a transcrição." },
                 { inlineData: { mimeType: mime, data: audio.toString("base64") } },
               ] }],
+              generationConfig: { audioTranscriptionConfig: { mode: "VERBATIM" } },
             }),
             signal,
           }
