@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { createClient, type Session } from "@supabase/supabase-js";
 import { Mic, Send, Pause, Play, Trash2, Copy, Loader2 } from "lucide-react";
-import { clearDraft, saveDraftMeta, appendAudioChunk, recoverDraft } from "../services/recordingDraft";
+import { clearDraft, saveDraftMeta, appendAudioChunk, recoverDraft, saveTranscript, recoverTranscript } from "../services/recordingDraft";
 
 const MAX_MS=180000;
 const url=import.meta.env.VITE_SUPABASE_URL;
@@ -71,6 +71,13 @@ export default function QuickTranscription(){
       setBlob(d.blob);setElapsed(d.durationMs);setMime(d.type);setPhase("ready");
       setNotice(d.partial?"Gravação interrompida recuperada. Ouça antes de enviar.":"Sua última gravação foi recuperada.");
     }).catch(()=>setNotice("Recuperação local indisponível neste navegador."));
+    recoverTranscript(ownerId).then(saved=>{
+      if(!mounted.current||!active||!saved)return;
+      // Never overwrite a draft recording; the person may still want to send it.
+      setCached(true);
+      setTranscript(prev=>prev||saved);
+      setPhase(prev=>prev==="idle"?"done":prev);
+    }).catch(()=>{});
     return ()=>{active=false};
   },[ownerId]);
   function saveMeta(ms:number,status:"recording"|"stopped"){
@@ -166,7 +173,9 @@ export default function QuickTranscription(){
       const data=await response.json() as JobResponse;
       if(!response.ok)throw Error(data.error||"O gateway não respondeu.");
       if(data.status==="ready"){
-        setCached(Boolean(data.cached));setTranscript(data.transcription||"");setPhase("done");await clearDraft(recordScope.current).catch(()=>{});return;
+        setCached(Boolean(data.cached));setTranscript(data.transcription||"");setPhase("done");
+        await saveTranscript(recordScope.current,data.transcription||"").catch(()=>{});
+        await clearDraft(recordScope.current).catch(()=>{});return;
       }
       if(!data.jobId)throw Error("Resposta inválida do gateway.");
       setPhase("processing");const controller=new AbortController();polling.current=controller;
@@ -178,7 +187,9 @@ export default function QuickTranscription(){
         });
         const result=await check.json() as JobResponse;
         if(!check.ok)throw Error(result.error||"Falha na consulta.");
-        if(result.status==="ready"){setTranscript(result.transcription||"");setPhase("done");await clearDraft(recordScope.current).catch(()=>{});return;}
+        if(result.status==="ready"){setTranscript(result.transcription||"");setPhase("done");
+          await saveTranscript(recordScope.current,result.transcription||"").catch(()=>{});
+          await clearDraft(recordScope.current).catch(()=>{});return;}
         if(result.status==="failed")throw Error(result.error||"Transcrição falhou.");
       }
       throw Error("O processamento demorou. Sua sessão não será enviada novamente.");
