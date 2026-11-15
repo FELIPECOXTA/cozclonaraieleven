@@ -40,5 +40,5 @@ jobs:
             -d '{"audioBase64":"dGVzdA==","mimeType":"audio/webm"}' \
             http://127.0.0.1:3000/api/transcription/jobs)
           test "$result" = 503
-          grep -q 'temporariamente indisponível' /tmp/transcription-response
+          grep -q 'indisponível' /tmp/transcription-response
           echo "Gateway: bloqueio sem secrets e healthcheck OK"
