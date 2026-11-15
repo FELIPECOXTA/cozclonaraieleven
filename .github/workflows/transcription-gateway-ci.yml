@@ -1,0 +1,26 @@
+name: Verificar gravador e gateway
+on:
+  push:
+    branches: [feat/gravador-whatsapp-cache-gateway]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Instalar dependências
+        run: npm install --no-audit --no-fund
+      - name: Checar TypeScript
+        run: npm run lint
+      - name: Testar limites e isolamento de cache
+        run: npm run test:gateway
+      - name: Compilar frontend
+        run: npm run build
