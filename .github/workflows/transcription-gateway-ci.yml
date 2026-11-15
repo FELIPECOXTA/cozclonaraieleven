@@ -24,3 +24,21 @@ jobs:
         run: npm run test:gateway
       - name: Compilar frontend
         run: npm run build
+      - name: Testar gateway em modo seguro sem secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run dev > /tmp/vozclonar.log 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          for i in {1..40}; do
+            if curl -fsS http://127.0.0.1:3000/api/health >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:3000/api/health | grep -q '"status":"ok"'
+          result=$(curl -s -o /tmp/transcription-response -w "%{http_code}" -H 'Content-Type: application/json' \
+            -d '{"audioBase64":"dGVzdA==","mimeType":"audio/webm"}' \
+            http://127.0.0.1:3000/api/transcription/jobs)
+          test "$result" = 503
+          grep -q 'temporariamente indisponível' /tmp/transcription-response
+          echo "Gateway: bloqueio sem secrets e healthcheck OK"
