@@ -5,6 +5,7 @@ import { createServer as createViteServer } from "vite";
 import path from "path";
 import { fileURLToPath } from "url";
 import fs from "fs";
+import { mountTranscriptionGateway } from "./src/server/transcriptionGateway";
 
 dotenv.config();
 
@@ -17,6 +18,9 @@ const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 // Middleware for large payload (audio base64)
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
+
+// Rota assíncrona protegida: sem usuário autenticado e Redis, falha fechada.
+mountTranscriptionGateway(app);
 
 // Server-side Gemini client
 const getAiClient = () => {
