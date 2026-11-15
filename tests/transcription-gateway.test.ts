@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { decodeAudio, isPermittedMime, scopedCacheKey, MAX_AUDIO_SECONDS } from "../src/server/transcriptionGateway";
+import { decodeAudio, isPermittedMime, scopedCacheKey, sealTranscript, unsealTranscript, MAX_AUDIO_SECONDS } from "../src/server/transcriptionGateway";
 
 test("limite do gravador é exatamente 180 segundos",()=>{
   assert.equal(MAX_AUDIO_SECONDS,180);
@@ -28,4 +28,13 @@ test("cache não se mistura entre duas contas",()=>{
   assert.equal(key1,scopedCacheKey("test-secret","user-felipe",input));
   assert.notEqual(key1,scopedCacheKey("test-secret","user-felipe",Buffer.from("different recording")));
   assert.equal(key1.length,64);
+});
+
+test("transcrição no Redis é criptografada e exige a mesma chave",()=>{
+  const privateText="Texto particular do usuário. Não deve aparecer no banco.";
+  const encrypted=sealTranscript(privateText,"chave-a-testes");
+  assert.equal(encrypted.includes(privateText),false);
+  assert.equal(unsealTranscript(encrypted,"chave-a-testes"),privateText);
+  assert.throws(()=>unsealTranscript(encrypted,"chave-errada"));
+  assert.notEqual(encrypted,sealTranscript(privateText,"chave-a-testes"));
 });
