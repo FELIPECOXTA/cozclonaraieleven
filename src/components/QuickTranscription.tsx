@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { createClient, type Session } from "@supabase/supabase-js";
 import { Mic, Send, Pause, Play, Trash2, Copy, Loader2 } from "lucide-react";
 import { clearDraft, saveDraftMeta, appendAudioChunk, recoverDraft, saveTranscript, recoverTranscript } from "../services/recordingDraft";
+import { rememberPendingJob, recoverPendingJob, forgetPendingJob } from "../services/pendingJob";
 
 const MAX_MS=180000;
 const url=import.meta.env.VITE_SUPABASE_URL;
@@ -45,6 +46,7 @@ export default function QuickTranscription(){
   const mounted=useRef(true);
   const canceled=useRef(false);
   const polling=useRef<AbortController|null>(null);
+  const pollSequence=useRef(0);
   const release=()=>{tracks.current?.getTracks().forEach(t=>t.stop());tracks.current=null};
   const stopClock=()=>{if(timer.current!==undefined)clearInterval(timer.current);timer.current=undefined};
   function setBlob(blob:Blob){
@@ -58,27 +60,31 @@ export default function QuickTranscription(){
       auth.auth.getSession().then(({data})=>{if(mounted.current)setSession(data.session);});
       subscription=auth.auth.onAuthStateChange((_evt,s)=>setSession(s)).data.subscription;
     }
-    return ()=>{mounted.current=false;subscription?.unsubscribe();stopClock();release();polling.current?.abort();if(blobUrl.current)URL.revokeObjectURL(blobUrl.current)};
+    return ()=>{mounted.current=false;pollSequence.current++;subscription?.unsubscribe();stopClock();release();polling.current?.abort();if(blobUrl.current)URL.revokeObjectURL(blobUrl.current)};
   },[]);
   const ownerId=session?.user.id||"guest";
   useEffect(()=>{
     let active=true;
-    if(["recording","paused","sending","processing"].includes(phase))return;
+    const loggedIn=session?.user.id;
+    const pending=loggedIn?recoverPendingJob(loggedIn):null;
+    if(["recording","paused","sending"].includes(phase))return;
     if(blobUrl.current)URL.revokeObjectURL(blobUrl.current);
-    blobUrl.current="";setAudio(null);setPlayerSrc("");setTranscript("");setPhase("idle");setElapsed(0);
+    blobUrl.current="";setAudio(null);setPlayerSrc("");setTranscript("");
+    setPhase(pending?"processing":"idle");setElapsed(0);
+    // Recover the local recording before asking for another provider request.
     recoverDraft(ownerId).then(d=>{
       if(!mounted.current||!active||!d)return;
-      setBlob(d.blob);setElapsed(d.durationMs);setMime(d.type);setPhase("ready");
-      setNotice(d.partial?"Gravação interrompida recuperada. Ouça antes de enviar.":"Sua última gravação foi recuperada.");
-    }).catch(()=>setNotice("Recuperação local indisponível neste navegador."));
+      setBlob(d.blob);setElapsed(d.durationMs);setMime(d.type);
+      if(!pending)setPhase("ready");
+      setNotice(d.partial?"Recuperamos a gravação interrompida. Ouça antes de enviar.":"Sua gravação ficou salva neste aparelho.");
+    }).catch(()=>setNotice("A gravação local não pôde ser recuperada neste navegador."));
     recoverTranscript(ownerId).then(saved=>{
-      if(!mounted.current||!active||!saved)return;
-      // Never overwrite a draft recording; the person may still want to send it.
-      setCached(true);
-      setTranscript(prev=>prev||saved);
+      if(!mounted.current||!active||!saved||pending)return;
+      setCached(true);setTranscript(saved);
       setPhase(prev=>prev==="idle"?"done":prev);
     }).catch(()=>{});
-    return ()=>{active=false};
+    if(pending&&session)void watchJob(pending,session.access_token,loggedIn);
+    return ()=>{active=false;pollSequence.current++;polling.current?.abort();};
   },[ownerId]);
   function saveMeta(ms:number,status:"recording"|"stopped"){
     writes.current=writes.current.then(()=>saveDraftMeta(recordScope.current,{startedAt:Date.now()-ms,elapsedMs:ms,mimeType:mimeRef.current,status})).catch(()=>setNotice("O navegador não conseguiu salvar o rascunho."));
@@ -156,7 +162,7 @@ export default function QuickTranscription(){
     }
   }
   async function discard(){
-    canceled.current=true;polling.current?.abort();
+    canceled.current=true;pollSequence.current++;polling.current?.abort();
     if(media.current&&media.current.state!=="inactive")media.current.stop();
     stopClock();release();await writes.current.catch(()=>{});await clearDraft(recordScope.current).catch(()=>{});
     if(blobUrl.current)URL.revokeObjectURL(blobUrl.current);
@@ -167,47 +173,112 @@ export default function QuickTranscription(){
     const {error:err}=await auth.auth.signInWithOtp({email,options:{emailRedirectTo:location.origin}});
     if(err)setError("Não foi possível enviar seu link de acesso.");else{setError("");setLoginSent(true);}
   }
-  async function send(){
-    if(!auth||!session){setError("Entre na sua conta para transcrever.");return;}
-    if(!audio||audio.size>15*1024*1024){setError("Áudio ausente ou muito grande.");return;}
-    if(elapsed>MAX_MS){setError("O limite é de três minutos.");return;}
-    setError("");setPhase("sending");
-    try{
-      const base64=await asBase64(audio);
-      const response=await fetch("/api/transcription/jobs",{
-        method:"POST",headers:{"Content-Type":"application/json",Authorization:"Bearer "+session.access_token},
-        body:JSON.stringify({audioBase64:base64,mimeType:mime})
-      });
-      const data=await response.json() as JobResponse;
-      if(!response.ok)throw Error(data.error||"O gateway não respondeu.");
-      if(data.status==="ready"){
-        setCached(Boolean(data.cached));setTranscript(data.transcription||"");setPhase("done");
-        await saveTranscript(recordScope.current,data.transcription||"").catch(()=>{});
-        await clearDraft(recordScope.current).catch(()=>{});return;
-      }
-      if(!data.jobId)throw Error("Resposta inválida do gateway.");
-      setPhase("processing");const controller=new AbortController();polling.current=controller;
-      for(let i=0;i<90;i++){
-        await new Promise(r=>setTimeout(r,2000));
-        if(controller.signal.aborted)return;
-        const check=await fetch("/api/transcription/jobs/"+encodeURIComponent(data.jobId),{
-          headers:{Authorization:"Bearer "+session.access_token},signal:controller.signal
+  async function watchJob(jobId:string,accessToken:string,accountId:string){
+    const seq=++pollSequence.current;
+    let failures=0;
+    const start=Date.now();
+    setPhase("processing");
+    setNotice("Sua mensagem foi recebida. Estamos preparando o texto, você não precisa reenviar.");
+    while(mounted.current&&seq===pollSequence.current){
+      // Poll the existing task only. The AI providers are never called by this GET.
+      const elapsed=Date.now()-start;
+      const delay=elapsed<20_000?1800:elapsed<60_000?3000:5000;
+      await new Promise(resolve=>setTimeout(resolve,delay));
+      if(!mounted.current||seq!==pollSequence.current)return;
+      const controller=new AbortController();polling.current=controller;
+      const deadline=setTimeout(()=>controller.abort(),12000);
+      try{
+        const res=await fetch("/api/transcription/jobs/"+encodeURIComponent(jobId),{
+          headers:{Authorization:"Bearer "+accessToken},signal:controller.signal
         });
-        const result=await check.json() as JobResponse;
-        if(!check.ok)throw Error(result.error||"Falha na consulta.");
-        if(result.status==="ready"){setTranscript(result.transcription||"");setPhase("done");
-          await saveTranscript(recordScope.current,result.transcription||"").catch(()=>{});
-          await clearDraft(recordScope.current).catch(()=>{});return;}
-        if(result.status==="failed")throw Error(result.error||"Transcrição falhou.");
+        if(res.status===401){
+          setNotice("Sua sessão expirou. Entre novamente para consultar o resultado.");
+          return;
+        }
+        if(res.status===404){
+          forgetPendingJob(accountId);
+          setPhase("ready");setNotice("Não encontramos o processamento anterior. Sua gravação está salva para tentar novamente.");
+          return;
+        }
+        if(!res.ok)throw Error("Temporary connection issue");
+        const result=await res.json() as JobResponse;
+        failures=0;
+        if(result.status==="ready"){
+          const text=String(result.transcription||"").trim();
+          if(!text)throw Error("No text");
+          forgetPendingJob(accountId);
+          setTranscript(text);setPhase("done");setNotice("");
+          await saveTranscript(accountId,text).catch(()=>{});
+          await clearDraft(accountId).catch(()=>{});
+          return;
+        }
+        if(result.status==="failed"){
+          forgetPendingJob(accountId);
+          setPhase("ready");
+          setNotice("Não conseguimos terminar desta vez. Sua gravação foi preservada. Você pode tentar novamente.");
+          return;
+        }
+        if(elapsed>60_000)setNotice("Estamos levando um pouco mais de tempo. Pode voltar a esta página quando quiser.");
+      }catch{
+        if(controller.signal.aborted&&(!mounted.current||seq!==pollSequence.current))return;
+        failures++;
+        if(failures>2)setNotice("A conexão oscilou, mas sua gravação continua salva. Vamos consultar novamente.");
+      }finally{clearTimeout(deadline);}
+      // Keep the job ID for later visits and stop frequent polls after 5 minutes.
+      if(Date.now()-start>300_000){
+        setNotice("Ainda estamos processando. Você pode sair e voltar depois para consultar a mesma tarefa.");
+        return;
       }
-      throw Error("O processamento demorou. Sua sessão não será enviada novamente.");
-    }catch(e){
-      if(mounted.current){setError(e instanceof Error?e.message:"Falha na transcrição.");setPhase("ready");}
     }
   }
+  async function send(){
+    if(!auth||!session){setNotice("Entre na sua conta para transcrever.");return;}
+    if(!audio||audio.size>15*1024*1024){setNotice("Não foi possível ler a gravação. Confira o áudio.");return;}
+    if(elapsed>MAX_MS){setNotice("A gravação pode ter até três minutos.");return;}
+    const accountId=session.user.id;
+    recordScope.current=accountId;
+    const alreadyPending=recoverPendingJob(accountId);
+    if(alreadyPending){void watchJob(alreadyPending,session.access_token,accountId);return;}
+    setError("");setNotice("");setPhase("sending");
+    const payload=JSON.stringify({audioBase64:await asBase64(audio),mimeType:mime});
+    for(let attempt=0;attempt<2;attempt++){
+      const controller=new AbortController();
+      const deadline=setTimeout(()=>controller.abort(),13000);
+      try{
+        const response=await fetch("/api/transcription/jobs",{
+          method:"POST",
+          headers:{"Content-Type":"application/json",Authorization:"Bearer "+session.access_token},
+          body:payload,signal:controller.signal
+        });
+        const data=await response.json() as JobResponse;
+        if(!response.ok){
+          if(response.status===429){setNotice("Você já usou sua sessão gratuita. Sua gravação continua disponível.");setPhase("ready");return;}
+          if(response.status===401){setNotice("Entre na sua conta novamente para continuar.");setPhase("ready");return;}
+          if(response.status===400||response.status===413){setNotice("Não conseguimos processar essa gravação. Confira o áudio.");setPhase("ready");return;}
+          throw Error("Unavailable");
+        }
+        if(data.status==="ready"&&data.transcription){
+          setCached(Boolean(data.cached));setTranscript(data.transcription);setPhase("done");
+          await saveTranscript(accountId,data.transcription).catch(()=>{});
+          await clearDraft(accountId).catch(()=>{});
+          return;
+        }
+        if(!data.jobId)throw Error("Job missing");
+        rememberPendingJob(accountId,data.jobId);
+        void watchJob(data.jobId,session.access_token,accountId);
+        return;
+      }catch{
+        if(!mounted.current)return;
+        setNotice("Estamos conectando sua gravação com segurança. Aguarde um instante.");
+        if(attempt===0)await new Promise(resolve=>setTimeout(resolve,1200));
+      }finally{clearTimeout(deadline);}
+    }
+    setPhase("ready");
+    setNotice("Ainda não conseguimos enviar. Sua gravação ficou salva para você tentar novamente.");
+  }
   return <div className="max-w-2xl mx-auto text-slate-50 space-y-5">
-    <div className="text-center space-y-1"><h2 className="text-2xl font-bold">Fale. Nós transcrevemos.</h2><p className="text-sm text-slate-300">Uma mensagem de voz de até 3 minutos, como no WhatsApp.</p></div>
-    <section className="bg-[#111e2b] border border-slate-700 rounded-3xl p-4 sm:p-6 space-y-4 shadow-xl">
+    <div className="text-center space-y-1"><h2 className="text-2xl sm:text-3xl font-bold">Fale. Nós transcrevemos.</h2><p className="text-sm text-slate-300">Uma mensagem de voz de até 3 minutos, como no WhatsApp.</p></div>
+    <section className="bg-[#111e2b] border border-slate-700 rounded-3xl p-4 sm:p-6 space-y-4 shadow-xl max-w-full min-w-0">
       <div className="bg-[#202c33] rounded-2xl flex items-center gap-3 px-3 py-4">
         <button onClick={begin} type="button" disabled={["recording","paused","sending","processing"].includes(phase)} aria-label="Iniciar gravação" className={"rounded-full w-14 h-14 shrink-0 grid place-items-center text-white "+(phase==="recording"?"bg-red-600 animate-pulse":"bg-emerald-700")}><Mic size={27}/></button>
         <div className="flex-1 min-w-0">
@@ -228,7 +299,8 @@ export default function QuickTranscription(){
         </div>
       </div>}
       {phase==="idle"&&<button type="button" onClick={begin} className="w-full min-h-12 bg-emerald-700 rounded-xl font-bold">Gravar áudio</button>}
-      {["sending","processing"].includes(phase)&&<p className="text-sm flex items-center gap-2"><Loader2 size={17} className="animate-spin"/>{phase==="sending"?"Enviando...":"Transcrevendo, sem reenviar o áudio."}</p>}
+      {["sending","processing"].includes(phase)&&<div role="status" aria-live="polite" className="rounded-2xl bg-slate-800/80 p-3 text-sm flex items-center gap-3"><Loader2 size={20} className="shrink-0 animate-spin text-emerald-300"/><span>{phase==="sending"?"Enviando sua mensagem com segurança...":"Estamos transformando sua mensagem em texto. Você não precisa fazer mais nada."}</span></div>}
+      {phase==="processing"&&session&&<button type="button" onClick={()=>{const id=recoverPendingJob(session.user.id);if(id)void watchJob(id,session.access_token,session.user.id)}} className="w-full min-h-11 rounded-xl bg-slate-700 px-4 text-sm">Verificar resultado novamente</button>}
       {notice&&<p className="text-xs text-slate-300" role="status">{notice}</p>}
       {error&&<p className="text-sm text-red-300" role="alert">{error}</p>}
       <p className="text-xs text-slate-400">O rascunho fica neste dispositivo. Sem upload automático, mesmo se você fechar a aba.</p>
