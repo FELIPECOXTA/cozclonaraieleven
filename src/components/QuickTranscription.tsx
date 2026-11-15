@@ -117,20 +117,28 @@ export default function QuickTranscription(){
       const rec=preferred?new MediaRecorder(stream,{mimeType:preferred,audioBitsPerSecond:64000}):new MediaRecorder(stream,{audioBitsPerSecond:64000});
       mimeRef.current=rec.mimeType.split(";")[0]||"audio/webm";setMime(mimeRef.current);lastSavedAt.current=0;
       media.current=rec;spent.current=0;canceled.current=false;writes.current=Promise.resolve();
-      let chunks:Blob[]=[];
+      const recordingOwner=recordScope.current;
       rec.ondataavailable=event=>{
         if(event.data.size===0)return;
-        chunks.push(event.data);
-        writes.current=writes.current.then(()=>appendAudioChunk(recordScope.current,event.data)).catch(()=>setNotice("Seu áudio não está sendo salvo localmente. Evite fechar esta página."));
+        // Persistir as fatias diretamente no IndexedDB, sem manter uma cópia extra em RAM.
+        writes.current=writes.current.then(()=>appendAudioChunk(recordingOwner,event.data))
+          .catch(()=>setNotice("Não foi possível guardar o áudio. Evite fechar esta página."));
       };
       rec.onstop=()=>{
         stopClock();release();
         if(canceled.current)return;
-        const blob=new Blob(chunks,{type:mimeRef.current});chunks=[];
-        if(!mounted.current)return;
-        if(!blob.size){setError("Não foi possível gravar áudio.");setPhase("idle");return;}
-        setBlob(blob);setPhase("ready");
-        setNotice("Gravação pronta. Ouça e envie quando quiser.");
+        void (async()=>{
+          try{
+            await writes.current;
+            const saved=await recoverDraft(recordingOwner);
+            if(!mounted.current||canceled.current||media.current!==rec)return;
+            if(!saved?.blob.size){setError("Não foi possível gravar áudio.");setPhase("idle");return;}
+            setBlob(saved.blob);setPhase("ready");
+            setNotice("Gravação pronta. Ouça e envie quando quiser.");
+          }catch{
+            if(mounted.current){setError("Erro ao recuperar o áudio gravado.");setPhase("idle");}
+          }
+        })();
       };
       rec.onerror=()=>setError("Erro do microfone. Tente gravar novamente.");
       rec.start(1000);currentStart.current=Date.now();setPhase("recording");saveMeta(0,"recording");tick();
