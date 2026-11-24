@@ -1,0 +1,54 @@
+name: Verificar gravador e gateway
+on:
+  push:
+    branches: [feat/gravador-whatsapp-cache-gateway]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Instalar dependências
+        run: npm install --no-audit --no-fund
+      - name: Checar TypeScript
+        run: npm run lint
+      - name: Testar limites e isolamento de cache
+        run: npm run test:gateway
+      - name: Compilar frontend
+        run: npm run build
+      - name: Instalar Chromium para testes responsivos
+        run: npx playwright install --with-deps chromium
+      - name: Testar gateway em modo seguro sem secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run dev > /tmp/vozclonar.log 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          for i in {1..40}; do
+            if curl -fsS http://127.0.0.1:3000/api/health >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:3000/api/health | grep -q '"status":"ok"'
+          result=$(curl -s -o /tmp/transcription-response -w "%{http_code}" -H 'Content-Type: application/json' \
+            -d '{"audioBase64":"dGVzdA==","mimeType":"audio/webm"}' \
+            http://127.0.0.1:3000/api/transcription/jobs)
+          test "$result" = 503
+          grep -q 'indisponível' /tmp/transcription-response
+          echo "Gateway: bloqueio sem secrets e healthcheck OK"
+          npm run test:visual
+      - name: Guardar imagens da web e celulares
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: transcricao-ui-mobile-web
+          path: artifacts/transcription-*.png
+          if-no-files-found: ignore

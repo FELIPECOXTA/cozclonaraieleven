@@ -20,45 +20,32 @@ import {
   Bookmark,
   Key,
 } from "lucide-react";
-import { ClonedVoice } from "./types";
-import { ElevenLabsSpeechSynthesis } from "./components/ElevenLabsSpeechSynthesis";
-import { ElevenLabsCreateVoice } from "./components/ElevenLabsCreateVoice";
-import { ElevenLabsVoiceLibrary } from "./components/ElevenLabsVoiceLibrary";
-import { ElevenLabsVoiceChanger } from "./components/ElevenLabsVoiceChanger";
-import { ElevenLabsSoundEffects } from "./components/ElevenLabsSoundEffects";
-import { VoiceClonerStudio } from "./components/VoiceClonerStudio";
-import { ChatAssistant } from "./components/ChatAssistant";
-import { ImageStudio } from "./components/ImageStudio";
-import { ApiKeyModal } from "./components/ApiKeyModal";
+import type { ClonedVoice } from "./types";
+const ElevenLabsSpeechSynthesis = React.lazy(() => import("./components/ElevenLabsSpeechSynthesis").then(m => ({ default: m.ElevenLabsSpeechSynthesis })));
+const ElevenLabsCreateVoice = React.lazy(() => import("./components/ElevenLabsCreateVoice").then(m => ({ default: m.ElevenLabsCreateVoice })));
+const ElevenLabsVoiceLibrary = React.lazy(() => import("./components/ElevenLabsVoiceLibrary").then(m => ({ default: m.ElevenLabsVoiceLibrary })));
+const ElevenLabsVoiceChanger = React.lazy(() => import("./components/ElevenLabsVoiceChanger").then(m => ({ default: m.ElevenLabsVoiceChanger })));
+const ElevenLabsSoundEffects = React.lazy(() => import("./components/ElevenLabsSoundEffects").then(m => ({ default: m.ElevenLabsSoundEffects })));
+const VoiceClonerStudio = React.lazy(() => import("./components/VoiceClonerStudio").then(m => ({ default: m.VoiceClonerStudio })));
+const ChatAssistant = React.lazy(() => import("./components/ChatAssistant").then(m => ({ default: m.ChatAssistant })));
+const ImageStudio = React.lazy(() => import("./components/ImageStudio").then(m => ({ default: m.ImageStudio })));
+const ApiKeyModal = React.lazy(() => import("./components/ApiKeyModal").then(m => ({ default: m.ApiKeyModal })));
+import QuickTranscription from "./components/QuickTranscription";
 
-type TabKey = "synthesis" | "create-voice" | "sts" | "sfx" | "library" | "slots3" | "chat" | "images" | "guide";
+type TabKey = "transcription" | "synthesis" | "create-voice" | "sts" | "sfx" | "library" | "slots3" | "chat" | "images" | "guide";
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<TabKey>("synthesis");
+  const [activeTab, setActiveTab] = useState<TabKey>("transcription");
   const [transferredText, setTransferredText] = useState<string>("");
+  const [showLegacyTools,setShowLegacyTools] = useState(false);
 
   // ElevenLabs API Key state
-  const [elevenLabsApiKey, setElevenLabsApiKey] = useState<string>(() => {
-    try {
-      return localStorage.getItem("elevenlabs_api_key") || "";
-    } catch {
-      return "";
-    }
-  });
+  // Nunca persistir chaves de provedores no localStorage.
+  const [elevenLabsApiKey, setElevenLabsApiKey] = useState("");
+  const legacyEnabled = import.meta.env.VITE_ENABLE_LEGACY_TOOLS === "true";
   const [isApiKeyModalOpen, setIsApiKeyModalOpen] = useState(false);
 
-  const handleSaveApiKey = (newKey: string) => {
-    setElevenLabsApiKey(newKey);
-    try {
-      if (newKey) {
-        localStorage.setItem("elevenlabs_api_key", newKey);
-      } else {
-        localStorage.removeItem("elevenlabs_api_key");
-      }
-    } catch (err) {
-      console.warn("Falha ao salvar chave no localStorage:", err);
-    }
-  };
+  const handleSaveApiKey = (newKey: string) => setElevenLabsApiKey(newKey);
 
   // Voices loaded from server
   const [voices, setVoices] = useState<ClonedVoice[]>([]);
@@ -126,7 +113,7 @@ export default function App() {
         <div className="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-3">
           {/* Logo & Brand */}
           <div
-            onClick={() => setActiveTab("synthesis")}
+            onClick={() => setActiveTab("transcription")}
             className="flex items-center gap-3 cursor-pointer select-none group"
           >
             <div className="w-9 h-9 rounded-2xl bg-gradient-to-tr from-indigo-500 via-purple-500 to-indigo-600 text-white flex items-center justify-center shadow-lg shadow-indigo-500/25 group-hover:scale-105 transition-transform">
@@ -134,21 +121,19 @@ export default function App() {
             </div>
             <div>
               <div className="flex items-center gap-2">
-                <h1 className="text-base sm:text-lg font-black tracking-tight text-white group-hover:text-indigo-400 transition-colors">
-                  Eleven<span className="text-indigo-400">Voice</span> AI
-                </h1>
+                <h1 className="text-base sm:text-lg font-black tracking-tight text-white group-hover:text-indigo-400 transition-colors">Transcreva AI</h1>
                 <span className="hidden sm:inline-flex items-center text-[10px] font-mono uppercase tracking-wider px-2 py-0.5 rounded-full bg-indigo-500/10 text-indigo-300 border border-indigo-500/30 font-bold">
                   VoiceLab Studio
                 </span>
               </div>
               <p className="text-[10px] sm:text-[11px] text-slate-400 leading-none">
-                Clonagem Instantânea & Síntese Idêntica de Voz
+                Grave e transcreva em até 3 minutos
               </p>
             </div>
           </div>
 
           {/* ElevenLabs API Key Connection Pill */}
-          <div className="flex items-center gap-2">
+          {legacyEnabled && showLegacyTools && <div className="flex items-center gap-2">
             <button
               type="button"
               onClick={() => setIsApiKeyModalOpen(true)}
@@ -165,10 +150,19 @@ export default function App() {
                   : "⚡ Conectar Chave ElevenLabs (Voz 100% Real)"}
               </span>
             </button>
-          </div>
+          </div>}
 
           {/* Navigation Tabs */}
           <nav className="flex items-center gap-1 bg-slate-900/90 p-1 rounded-2xl border border-slate-800 overflow-x-auto max-w-full">
+            <button type="button" onClick={() => setActiveTab("transcription")}
+              aria-current={activeTab==="transcription"?"page":undefined}
+              className={"flex items-center gap-2 px-4 py-2 rounded-xl min-h-11 text-sm font-bold whitespace-nowrap "+(activeTab==="transcription"?"bg-emerald-600 text-white":"bg-slate-800 text-white")}>
+              <Mic size={18}/> Transcrever áudio
+            </button>
+            {legacyEnabled && <button type="button" onClick={() => setShowLegacyTools(v => !v)}
+              className="min-h-11 px-3 py-2 rounded-xl text-xs text-slate-300 whitespace-nowrap"
+              aria-expanded={showLegacyTools}>Outras ferramentas</button>}
+            {legacyEnabled && showLegacyTools && <>
             <button
               onClick={() => setActiveTab("synthesis")}
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold transition-all whitespace-nowrap ${
@@ -267,12 +261,15 @@ export default function App() {
               <ImageIcon className="w-3.5 h-3.5" />
               <span className="hidden md:inline">Avatares 4K</span>
             </button>
+            </>}
           </nav>
         </div>
       </header>
 
       {/* Main Container */}
       <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 lg:p-8">
+      <React.Suspense fallback={<p role="status">Carregando ferramenta...</p>}>
+        {activeTab === "transcription" && <QuickTranscription/>}
         {/* Tab 1: ElevenLabs Speech Synthesis (Texto para Fala) */}
         {activeTab === "synthesis" && (
           <ElevenLabsSpeechSynthesis
@@ -353,15 +350,16 @@ export default function App() {
             <ImageStudio />
           </div>
         )}
+      </React.Suspense>
       </main>
 
       {/* Modal for connecting ElevenLabs API Key */}
-      <ApiKeyModal
+      {legacyEnabled && <ApiKeyModal
         isOpen={isApiKeyModalOpen}
         onClose={() => setIsApiKeyModalOpen(false)}
         currentKey={elevenLabsApiKey}
         onSaveKey={handleSaveApiKey}
-      />
+      />}
 
       {/* Footer */}
       <footer className="border-t border-slate-800/80 bg-slate-950/60 px-4 py-4 text-center text-xs text-slate-500">
@@ -369,11 +367,11 @@ export default function App() {
           <div className="flex items-center gap-2">
             <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
             <span>
-              ElevenVoice AI • VoiceLab Clone Engine • Suporte Oficial à API da ElevenLabs + Gemini 3.8
+              Transcreva AI · Gravação rápida e limite de três minutos
             </span>
           </div>
           <div className="flex items-center gap-4 text-slate-400">
-            <span>Modelos: eleven_multilingual_v2 • gemini-3.8-flash-lite-tts • gemini-3-pro-image-preview</span>
+            <span>Gravação local · Transcrição sob demanda · Cota protegida por conta</span>
           </div>
         </div>
       </footer>
